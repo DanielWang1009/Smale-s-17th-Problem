@@ -1,0 +1,261 @@
+
+import time
+from scipy.linalg import svd
+from scipy.optimize import line_search
+
+
+def generate_test_data(m, n, condition_number=None):
+    if condition_number is None:
+        A = np.random.randn(m, n)
+    else:
+        U = np.random.randn(m, m)
+        V = np.random.randn(n, n)
+        U, _ = np.linalg.qr(U)
+        V, _ = np.linalg.qr(V)
+        singular_values = np.logspace(0, -np.log10(condition_number), min(m, n))
+        S = np.zeros((m, n))
+        np.fill_diagonal(S, singular_values)
+        A = U @ S @ V.T
+    b = np.random.randn(m)
+    return A, b
+
+
+def objective_function(x, A, b):
+    residual = A @ x - b
+    return 0.5 * np.dot(residual, residual)
+
+
+def gradient(x, A, b):
+    return A.T @ (A @ x - b)
+
+
+def gradient_descent(A, b, x0, max_iter=500, tol=1e-2):
+    x = x0.copy()
+    iter_count = 0
+    start_time = time.time()
+
+    for _ in range(max_iter):
+        g = gradient(x, A, b)
+        if np.linalg.norm(g) < tol:
+            break
+
+        alpha = 0.01
+        x = x - alpha * g
+        iter_count += 1
+
+    runtime = time.time() - start_time
+    obj_value = objective_function(x, A, b)
+    return x, iter_count, runtime, obj_value
+
+
+def standard_bfgs(A, b, x0, max_iter=10000, tol=1e-6):
+    x = x0.copy()
+    n = x0.shape[0]
+    H = np.eye(n)
+    iter_count = 0
+    start_time = time.time()
+
+    for _ in range(max_iter):
+        g = gradient(x, A, b)
+        if np.linalg.norm(g) < tol:
+            break
+
+        p = -H @ g
+        alpha = line_search(f=lambda x: objective_function(x, A, b),
+                            myfprime=lambda x: gradient(x, A, b),
+                            xk=x, pk=p)[0]
+        if alpha is None:
+            alpha = 0.01
+        s = alpha * p
+        x_new = x + s
+        y = gradient(x_new, A, b) - g
+
+        rho = 1.0 / (y.T @ s + 1e-10)
+        H = (np.eye(n) - rho * np.outer(s, y)) @ H @ (np.eye(n) - rho * np.outer(y, s)) + rho * np.outer(s, s)
+
+        x = x_new
+        iter_count += 1
+
+    runtime = time.time() - start_time
+    obj_value = objective_function(x, A, b)
+    return x, iter_count, runtime, obj_value
+
+
+def ideal_quasi_newton(A, b, x0, max_iter=10000, tol=1e-6):
+    x, gd_iter, gd_time, gd_obj = gradient_descent(A, b, x0, max_iter=500, tol=1e-2)
+    print(f"梯度下降预处理: 迭代次数={gd_iter}, 时间={gd_time:.4f}s, 目标函数值={gd_obj:.6e}")
+
+    n = x0.shape[0]
+    diag = np.sum(A ** 2, axis=0) + 1e-6
+    H = np.diag(1.0 / diag)
+    iter_count = 0
+    start_time = time.time()
+    errors = []
+    obj_values = [gd_obj]
+
+    for _ in range(max_iter):
+        g = gradient(x, A, b)
+        error = np.linalg.norm(g)
+        errors.append(error)
+        if error < tol:
+            break
+
+        p = -H @ g
+        alpha = line_search(f=lambda x: objective_function(x, A, b),
+                            myfprime=lambda x: gradient(x, A, b),
+                            xk=x, pk=p)[0]
+        if alpha is None:
+            alpha = 0.01
+        s = alpha * p
+        x_new = x + s
+        y = gradient(x_new, A, b) - g
+
+        current_obj = objective_function(x_new, A, b)
+        obj_values.append(current_obj)
+
+        try:
+            H_new = ideal_quasi_newton_update(H, s, y)
+            eigenvalues = np.linalg.eigvalsh(H_new)
+            if np.all(eigenvalues > 0):
+                H = H_new
+            else:
+                rho = 1.0 / (y.T @ s + 1e-10)
+                H = (np.eye(n) - rho * np.outer(s, y)) @ H @ (np.eye(n) - rho * np.outer(y, s)) + rho * np.outer(s, s)
+        except:
+            rho = 1.0 / (y.T @ s + 1e-10)
+            H = (np.eye(n) - rho * np.outer(s, y)) @ H @ (np.eye(n) - rho * np.outer(y, s)) + rho * np.outer(s, s)
+
+        x = x_new
+        iter_count += 1
+
+    runtime = time.time() - start_time
+    final_obj = objective_function(x, A, b)
+    return x, iter_count, runtime, errors, final_obj
+
+
+def ideal_quasi_newton_update(H, s, y):
+    eps = 1e-10
+    delta_x = s
+    S_y = H @ y
+    yT_S_y = y @ S_y
+    yTy = y @ y
+    sTy = s @ y
+    sTs = s @ s
+
+    denom2 = yTy
+
+    term1 = np.outer(y, delta_x) / np.dot(y, y)
+    rho = 1.0 / (sTy + eps)
+
+    S_yyT = np.outer(S_y, y)
+    s_yT = np.outer(s, y)
+    I = np.eye(H.shape[0])
+    term2 = ((np.dot(y, delta_x) ** 3) / np.dot(y, y)) * (H @ np.outer(y, y) - np.outer(delta_x, y))
+    term_l = rho * np.outer(s, y)
+    term_r = rho * np.outer(y, s)
+    term3 = 15 * (I - term_l) @ H @ (I - term_r)
+    return term1 + term2 + term3
+
+
+def test_algorithms(m, n, condition_number=None, num_trials=3):
+    success_bfgs = 0
+    success_ideal = 0
+    bfgs_errors = []
+    ideal_errors = []
+    bfgs_iter_counts = []
+    bfgs_times = []
+    ideal_iter_counts = []
+    ideal_times = []
+
+    # 添加目标函数值相关变量
+    bfgs_obj_values = []
+    ideal_obj_values = []
+    theoretical_obj_values = []
+
+    for trial in range(num_trials):
+        np.random.seed(int(time.time() * 1000) % (2 ** 32))
+        A, b = generate_test_data(m, n, condition_number)
+        x0 = np.random.randn(n)
+
+        # 计算理论最优解和目标值
+        try:
+            x_opt = np.linalg.lstsq(A, b, rcond=None)[0]
+            theoretical_obj = objective_function(x_opt, A, b)
+        except:
+            # 如果奇异值分解失败，使用伪逆
+            A_pinv = np.linalg.pinv(A)
+            x_opt = A_pinv @ b
+            theoretical_obj = objective_function(x_opt, A, b)
+
+        theoretical_obj_values.append(theoretical_obj)
+
+        print(
+            f"\nTrial {trial + 1}/{num_trials}, m={m}, n={n}, 条件数={condition_number if condition_number else '随机'}")
+        print(f"理论最小目标值: {theoretical_obj:.6e}")
+
+        # 标准 BFGS
+        x_bfgs, iter_bfgs, time_bfgs, obj_bfgs = standard_bfgs(A, b, x0)
+        error_bfgs = np.linalg.norm(gradient(x_bfgs, A, b))
+        bfgs_errors.append(error_bfgs)
+        bfgs_iter_counts.append(iter_bfgs)
+        bfgs_times.append(time_bfgs)
+        bfgs_obj_values.append(obj_bfgs)
+        if error_bfgs < 1e-6:
+            success_bfgs += 1
+        print(
+            f"标准 BFGS: 迭代次数={iter_bfgs}, 时间={time_bfgs:.4f}s, 梯度范数={error_bfgs:.2e}, 目标函数值={obj_bfgs:.6e}")
+        print(f"与理论最小值的差距: {obj_bfgs - theoretical_obj:.6e}")
+
+        # 拟牛顿法
+        x_ideal, iter_ideal, time_ideal, errors, obj_ideal = ideal_quasi_newton(A, b, x0)
+        error_ideal = np.linalg.norm(gradient(x_ideal, A, b))
+        ideal_errors.append(error_ideal)
+        ideal_iter_counts.append(iter_ideal)
+        ideal_times.append(time_ideal)
+        ideal_obj_values.append(obj_ideal)
+        if error_ideal < 1e-6:
+            success_ideal += 1
+        print(
+            f"拟牛顿法: 迭代次数={iter_ideal}, 时间={time_ideal:.4f}s, 梯度范数={error_ideal:.2e}, 目标函数值={obj_ideal:.6e}")
+        print(f"与理论最小值的差距: {obj_ideal - theoretical_obj:.6e}")
+        last_errors = errors[-5:] if len(errors) >= 5 else errors
+        print("最后梯度范数:", [f"{e:.2e}" for e in last_errors])
+
+    # 计算平均值
+    avg_bfgs_iter = np.mean(bfgs_iter_counts)
+    avg_bfgs_time = np.mean(bfgs_times)
+    avg_ideal_iter = np.mean(ideal_iter_counts)
+    avg_ideal_time = np.mean(ideal_times)
+
+    # 计算目标函数值相关平均值
+    avg_bfgs_obj = np.mean(bfgs_obj_values)
+    avg_ideal_obj = np.mean(ideal_obj_values)
+    avg_theoretical_obj = np.mean(theoretical_obj_values)
+
+    # 计算与理论最小值的平均差距
+    avg_bfgs_gap = np.mean([obj - theo for obj, theo in zip(bfgs_obj_values, theoretical_obj_values)])
+    avg_ideal_gap = np.mean([obj - theo for obj, theo in zip(ideal_obj_values, theoretical_obj_values)])
+
+    print(
+        f"\n成功率 (梯度范数 < 1e-6): 标准 BFGS: {success_bfgs / num_trials:.2%}, 拟牛顿法: {success_ideal / num_trials:.2%}")
+    print(f"平均梯度范数: 标准 BFGS: {np.mean(bfgs_errors):.2e}, 拟牛顿法: {np.mean(ideal_errors):.2e}")
+    print(f"平均迭代次数: 标准 BFGS: {avg_bfgs_iter:.1f}, 拟牛顿法: {avg_ideal_iter:.1f}")
+    print(f"平均时间: 标准 BFGS: {avg_bfgs_time:.4f}s, 拟牛顿法: {avg_ideal_time:.4f}s")
+
+    # 输出目标函数值相关信息
+    print(f"\n目标函数值分析:")
+    print(f"理论最小目标值平均值: {avg_theoretical_obj:.6e}")
+    print(f"标准 BFGS 平均目标值: {avg_bfgs_obj:.6e}, 与理论最小值的平均差距: {avg_bfgs_gap:.6e}")
+    print(f"拟牛顿法 平均目标值: {avg_ideal_obj:.6e}, 与理论最小值的平均差距: {avg_ideal_gap:.6e}")
+
+    # 输出各次试验的目标函数值
+    print("\n各次试验目标函数值:")
+    for i in range(num_trials):
+        print(
+            f"试验 {i + 1}: 理论={theoretical_obj_values[i]:.6e}, BFGS={bfgs_obj_values[i]:.6e}, 拟牛顿法={ideal_obj_values[i]:.6e}")
+
+print("=== 测试 1: 普通矩阵 ===")
+test_algorithms(m=100, n=50, num_trials=3)
+
+print("\n=== 测试 2: 病态矩阵 (条件数=1e8) ===")
+test_algorithms(m=300, n=150, condition_number=1e8, num_trials=200)
